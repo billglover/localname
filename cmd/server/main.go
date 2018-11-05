@@ -19,6 +19,7 @@ func main() {
 }
 
 func handler(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Access-Control-Allow-Origin", "*")
 	xff := req.Header.Get("X-Forwarded-For")
 	ip := net.ParseIP(xff)
 
