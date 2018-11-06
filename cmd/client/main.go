@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var remote = "https://billglover-golang.appspot.com/ip"
@@ -36,8 +37,8 @@ func main() {
 	cancel, err := start(domain, zoneID, awsAccessKey, awsAccessSecret, dur)
 	defer cancel()
 
-	for {
-	}
+	http.Handle("/metrics", promhttp.Handler())
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 // Start monitors the external IP address and updates the DNS record provided
