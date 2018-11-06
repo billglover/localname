@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -18,41 +20,81 @@ var remote = "https://billglover-golang.appspot.com/ip"
 
 func main() {
 
-	curIP, err := getIP(remote)
-	if err != nil {
-		log.Println("unable to get external IP:", err)
-	}
-	log.Println("external IP address", curIP.String())
+	// get environment configuration
+	domain := mustGetenv("LOCALNAME_DOMAIN")
+	zoneID := mustGetenv("LOCALNAME_ZONE_ID")
+	awsAccessKey := mustGetenv("AWS_ACCESS_KEY_ID")
+	awsAccessSecret := mustGetenv("AWS_SECRET_ACCESS_KEY")
+	pollFreq := mustGetenv("LOCALNAME_POLL_FREQ")
 
-	err = updateDNS(curIP, "myip.billglover.me", "Z1EH888BF5XP0N")
+	dur, err := time.ParseDuration(pollFreq)
 	if err != nil {
-		log.Println(err)
+		log.Fatal("unable to parse LOCALNAME_POLL_FREQ:", pollFreq)
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// start monitoring for changes in IP
+	cancel, err := start(domain, zoneID, awsAccessKey, awsAccessSecret, dur)
+	defer cancel()
 
 	for {
-		select {
-		case <-ticker.C:
+	}
+}
 
-			ip, err := getIP(remote)
-			if err != nil {
-				log.Println("unable to get external IP:", err)
-			}
+// Start monitors the external IP address and updates the DNS record provided
+// if the IP address changes. It makes an initial attempt to determine the
+// IP address and update the domain name. If it encounters an error in this
+// initial attempt it returns an error. If the initial attempt is successful
+// it continues to monitor for changes in the external IP address. Monitoring
+// can be cancelled by calling the cancel function. All errors encountered
+// after the initial attempt are deemed retryable and logged. They are not
+// returned to the caller.
+func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.CancelFunc, error) {
 
-			if curIP.Equal(ip) == false {
-				log.Println("external IP address changed", ip.String())
+	ctx, cancel := context.WithCancel(context.Background())
 
-				err = updateDNS(curIP, "myip.billglover.me", "Z1EH888BF5XP0N")
+	// Get the current IP address so that we have something to compare against.
+	curIP, err := getIP(remote)
+	if err != nil {
+		return cancel, errors.Wrap(err, "unable to get external IP")
+	}
+
+	// TODO: need to pass in AWS credentials
+	err = updateDNS(curIP, domain, zoneID)
+	if err != nil {
+		return cancel, errors.Wrap(err, "unable to update DNS record")
+	}
+
+	go func(ctx context.Context, curIP net.IP) {
+
+		ticker := time.NewTicker(d)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+
+				ip, err := getIP(remote)
 				if err != nil {
-					log.Println(err)
+					log.Println("unable to get external IP:", err)
+					continue
 				}
 
-				continue
+				if curIP.Equal(ip) == false {
+					log.Println("external IP address changed", ip.String())
+					err = updateDNS(ip, domain, zoneID)
+					if err != nil {
+						log.Println("unable to update DNS:", err)
+						continue
+					}
+					curIP = ip
+				}
+				log.Println("external IP address unchanged", ip.String())
 			}
 		}
-	}
+	}(ctx, curIP)
+	return cancel, nil
 }
 
 func getIP(service string) (net.IP, error) {
@@ -62,7 +104,7 @@ func getIP(service string) (net.IP, error) {
 	}
 
 	client := http.Client{
-		Timeout: 1 * time.Second,
+		Timeout: 5 * time.Second,
 	}
 
 	resp, err := client.Do(req)
@@ -89,6 +131,7 @@ func getIP(service string) (net.IP, error) {
 
 // UpdateDNS updates a DNS record to point to the provided IP address.
 func updateDNS(ip net.IP, name string, zoneID string) error {
+	log.Println("updating DNS:", name, zoneID, ip.String())
 
 	svc := route53.New(session.New())
 	input := &route53.ChangeResourceRecordSetsInput{
@@ -118,10 +161,13 @@ func updateDNS(ip net.IP, name string, zoneID string) error {
 		return errors.Wrap(err, "unable to update record set")
 	}
 
-	// TODO: result of svc.ChangeResourceRecordSets is a request
-	// identifier. Need to decide if we want to watch for this
-	// request to complete successfully, or just log the fact
-	// that we have submitted the request.
-
 	return nil
+}
+
+func mustGetenv(key string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		log.Fatal(key, " is not set")
+	}
+	return val
 }
