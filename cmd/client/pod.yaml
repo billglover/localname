@@ -19,7 +19,8 @@ spec:
         spec:
             containers:
                 - name: localname
-                  image: billglover/localname
+                  image: billglover/localname:arm
+                  imagePullPolicy: Always
                   env:
                       - name: LOCALNAME_DOMAIN
                         valueFrom:
