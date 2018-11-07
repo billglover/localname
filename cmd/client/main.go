@@ -14,18 +14,71 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var remote = "https://billglover-golang.appspot.com/ip"
 
+var (
+	getIPDurations = promauto.NewSummaryVec(prometheus.SummaryOpts{
+		Namespace:  "localname",
+		Subsystem:  "client",
+		Name:       "getIP_requests_durations_seconds",
+		Help:       "distribution of response times for getIP() requests",
+		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.1, 0.99: 0.001},
+	}, []string{"code"})
+	updateDNSDurations = promauto.NewSummary(prometheus.SummaryOpts{
+		Namespace:  "localname",
+		Subsystem:  "client",
+		Name:       "updateDNS_requests_durations_seconds",
+		Help:       "distribution of response times for updateDNS() requests",
+		Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.1, 0.99: 0.001},
+	})
+	ipAddressChanges = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "localname",
+		Subsystem: "client",
+		Name:      "ip_change_count",
+		Help:      "the number of times the IP address has changed",
+	})
+	ipAddressRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "localname",
+		Subsystem: "client",
+		Name:      "ip_request_count",
+		Help:      "the number of times the IP address has been requested",
+	})
+	ipAddressErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "localname",
+		Subsystem: "client",
+		Name:      "ip_request_error_count",
+		Help:      "the number of times a request for an IP address failed",
+	})
+	dnsUpdateRequests = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "localname",
+		Subsystem: "client",
+		Name:      "dns_update_request_count",
+		Help:      "the number of times a DNS update has been requested",
+	})
+	dnsUpdateErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "localname",
+		Subsystem: "client",
+		Name:      "dns_update_request_error_count",
+		Help:      "the number of times a request for a DNS update failed",
+	})
+)
+
 func main() {
 
 	// get environment configuration
+	// Note: AWS credentials are not passed to the AWS package, they are picked
+	// up directly from environment variables. Multiple sources of configuration
+	// can lead to hard to debug issues and so we ensure that these are specified
+	// in environment variables below.
+	mustGetenv("AWS_ACCESS_KEY_ID")
+	mustGetenv("AWS_SECRET_ACCESS_KEY")
 	domain := mustGetenv("LOCALNAME_DOMAIN")
 	zoneID := mustGetenv("LOCALNAME_ZONE_ID")
-	awsAccessKey := mustGetenv("AWS_ACCESS_KEY_ID")
-	awsAccessSecret := mustGetenv("AWS_SECRET_ACCESS_KEY")
 	pollFreq := mustGetenv("LOCALNAME_POLL_FREQ")
 
 	dur, err := time.ParseDuration(pollFreq)
@@ -34,8 +87,11 @@ func main() {
 	}
 
 	// start monitoring for changes in IP
-	cancel, err := start(domain, zoneID, awsAccessKey, awsAccessSecret, dur)
+	cancel, err := start(domain, zoneID, dur)
 	defer cancel()
+	if err != nil {
+		log.Fatal("unable to start monitor:", err)
+	}
 
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -49,7 +105,7 @@ func main() {
 // can be cancelled by calling the cancel function. All errors encountered
 // after the initial attempt are deemed retryable and logged. They are not
 // returned to the caller.
-func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.CancelFunc, error) {
+func start(domain, zoneID string, d time.Duration) (context.CancelFunc, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -59,7 +115,6 @@ func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.C
 		return cancel, errors.Wrap(err, "unable to get external IP")
 	}
 
-	// TODO: need to pass in AWS credentials
 	err = updateDNS(curIP, domain, zoneID)
 	if err != nil {
 		return cancel, errors.Wrap(err, "unable to update DNS record")
@@ -84,6 +139,7 @@ func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.C
 
 				if curIP.Equal(ip) == false {
 					log.Println("external IP address changed", ip.String())
+					ipAddressChanges.Inc()
 					err = updateDNS(ip, domain, zoneID)
 					if err != nil {
 						log.Println("unable to update DNS:", err)
@@ -91,7 +147,6 @@ func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.C
 					}
 					curIP = ip
 				}
-				log.Println("external IP address unchanged", ip.String())
 			}
 		}
 	}(ctx, curIP)
@@ -99,8 +154,11 @@ func start(domain, zoneID, awsKey, awsSecret string, d time.Duration) (context.C
 }
 
 func getIP(service string) (net.IP, error) {
+	ipAddressRequests.Inc()
+
 	req, err := http.NewRequest(http.MethodGet, remote, nil)
 	if err != nil {
+		ipAddressErrors.Inc()
 		return nil, errors.Wrap(err, "could not create request")
 	}
 
@@ -108,8 +166,12 @@ func getIP(service string) (net.IP, error) {
 		Timeout: 5 * time.Second,
 	}
 
+	rt := promhttp.InstrumentRoundTripperDuration(getIPDurations, http.DefaultTransport)
+	client.Transport = rt
+
 	resp, err := client.Do(req)
 	if err != nil {
+		ipAddressErrors.Inc()
 		return nil, errors.Wrap(err, "could not make request")
 	}
 
@@ -119,11 +181,13 @@ func getIP(service string) (net.IP, error) {
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
+		ipAddressErrors.Inc()
 		return nil, errors.Wrap(err, "could not read response body")
 	}
 
 	ip := net.ParseIP(strings.TrimSpace(string(body)))
 	if ip == nil {
+		ipAddressErrors.Inc()
 		return nil, errors.New("no IP returned from external service")
 	}
 
@@ -132,7 +196,10 @@ func getIP(service string) (net.IP, error) {
 
 // UpdateDNS updates a DNS record to point to the provided IP address.
 func updateDNS(ip net.IP, name string, zoneID string) error {
-	log.Println("updating DNS:", name, zoneID, ip.String())
+	dnsUpdateRequests.Inc()
+
+	timer := prometheus.NewTimer(updateDNSDurations)
+	defer timer.ObserveDuration()
 
 	svc := route53.New(session.New())
 	input := &route53.ChangeResourceRecordSetsInput{
@@ -157,11 +224,13 @@ func updateDNS(ip net.IP, name string, zoneID string) error {
 		HostedZoneId: aws.String(zoneID),
 	}
 
-	_, err := svc.ChangeResourceRecordSets(input)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := svc.ChangeResourceRecordSetsWithContext(ctx, input)
 	if err != nil {
+		dnsUpdateErrors.Inc()
 		return errors.Wrap(err, "unable to update record set")
 	}
-
 	return nil
 }
 
